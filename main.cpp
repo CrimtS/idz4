@@ -1,5 +1,5 @@
 #include <pthread.h>
-#include <future>
+#include <unistd.h>
 #include <deque>
 #include <random>
 #include <memory>
@@ -7,11 +7,14 @@
 #include <cstdio>
 
 using namespace std;
+// Массив товаров, в каждом отделе их четыре.
 string goods[3][4] =
         {{"Adderall",  "Aspirin",    "Paracetamol", "Glycine"},
          {"Milk",      "Sour Cream", "Cheddar",     "Cottage Cheese"},
          {"Spaghetti", "Fettuccine", "Pappardelle", "Bavette"}};
 
+// Класс покупателя, у него есть уникальное ID и очередь отделов, в которые ему еще надо попасть в определенном порядке
+// (deps_to_go)
 class Customer {
 public:
     int ID{};
@@ -30,9 +33,10 @@ public:
     }
 };
 
+// Класс продавца, содержащий в себе логическую переменную, занят ли он и мьютекс, обеспечивающий тот факт, чтобы
+// два покупателя не могли одновременно занять одну кассу. В деструкторе мьютекс уничтожается(в конце программы).
 class Seller {
 public:
-    deque<Customer> queue = deque<Customer>(0);
     bool is_busy = false;
 
     Seller() {
@@ -46,46 +50,68 @@ public:
     }
 };
 
+// Три продавца магазина
 Seller sellers[3];
+
+// Очередь покупателей
 deque<Customer> customers;
 
-void SellingThread(int id) {
-    Customer customer = customers[id];
-    int aisle_id = customer.deps_to_go[0];
-    while (sellers[aisle_id].is_busy) {
-        this_thread::sleep_for(std::chrono::seconds(1));
+
+// Основная функция для покупки, принимает уникальный ID покупателя и соотв. потока
+void Buying(int id) {
+    Customer customer;
+    //Собственно, покупатель
+    for (auto c: customers) {
+        if (c.ID == id) {
+            customer = c;
+        }
     }
+    // ID продавца, где покупатель стоит в очереди
+    int aisle_id = customer.deps_to_go.front();
+    customer.deps_to_go.pop_front();
+    // Пока продавец занят, покупатель "спит"
+    while (sellers[aisle_id].is_busy) {
+        sleep(1);
+    }
+    //Перед началом работы с продавцом мьютекс лочится, чтобы остальные не могли попасть на эту же кассу
     pthread_mutex_lock(&sellers[aisle_id].mutex);
     sellers[aisle_id].is_busy = true;
+
+    //Получаем случайное ID товара, который покупатель покупает в отделе
     random_device rd;
     uniform_int_distribution<size_t> u_dist(0, 3);
-    this_thread::sleep_for(std::chrono::seconds(2));
+    sleep(2);
     string good = goods[aisle_id][u_dist(rd)];
-    printf("Customer %d bought %s in aisle %d \n", customer.ID + 1, good.c_str(), customer.deps_to_go[0] + 1);
-    customer.deps_to_go.pop_front();
+    //Покупка
+    printf("Customer %d bought %s in aisle %d \n", customer.ID + 1, good.c_str(), aisle_id + 1);
+    //Удаляем текущий отдел из списка покупателя, ведь в нем он уже закупился
+    //Проверяем, есть ли еще отделы у него в списке. Если есть, то покупатель становится в очередь в этот отдел
     if (customer.deps_to_go.empty()) {
         customers.pop_front();
     } else {
         customers.pop_front();
         printf("Customer %d going to aisle %d \n", customer.ID + 1, customer.deps_to_go[0] + 1);
-        customers.emplace_back(customer.ID, customer.deps_to_go);
+        customers.emplace_back(Customer(customer.ID, customer.deps_to_go));
     }
+    //Разблокируем мьютекс и меняем логическую переменную, касса свободна для следующего покупателя
     pthread_mutex_unlock(&sellers[aisle_id].mutex);
     sellers[aisle_id].is_busy = false;
 }
 
-void *sellThread(void *args) {
+//Threading-функция, которая вызывает Buying, передавая ID покупателя
+void *BuyThreading(void *args) {
     int *customerID = (int *) args;
-    SellingThread(*(customerID));
+    Buying(*(customerID));
     return nullptr;
 }
 
-
+//Функция, запускающая магазин в работу. Создается список потоков покупок, которые джойнятся после завершения.
+//Это повторяется, пока очередь покупок не опустеет.
 void StartDay() {
     while (!customers.empty()) {
         deque<pthread_t> customerThreads = deque<pthread_t>(customers.size());
         for (int i = 0; i < customers.size(); i++) {
-            pthread_create(&customerThreads[i], nullptr, sellThread, &customers[i].ID);
+            pthread_create(&customerThreads[i], nullptr, BuyThreading, &customers[i].ID);
         }
         for (auto thread: customerThreads) {
             pthread_join(thread, nullptr);
@@ -93,8 +119,9 @@ void StartDay() {
     }
 }
 
+//main
 int main() {
-    setlocale(LC_ALL, "ru_RU.UTF-8");
+    //Ввод числа покупателей в день, оно не может быть отрицательным
     cout << "Enter the number of customers today:";
     int customers_number;
     cin >> customers_number;
@@ -102,8 +129,10 @@ int main() {
         cout << "You entered a netgative number, please retry:";
         cin >> customers_number;
     }
+    //Ввод и проверка списков от жены каждого покупателя(отделов по порядку) и добавление их в очередь
+    //Списки не могут начинаться с 0, а также содержать отрицательные значения, значения >3
     cout << "For each customer enter ID's of aisles for purchases (aisles 1,2,3)"
-            "in wanted order. \nIf customer does NOT want to go to all three aisles, put zeros AFTER wanted ID's. \n"
+            "in wanted order. \nIf customer does NOT want to go to all three aisles, put -1 AFTER wanted ID's. \n"
             "(Code is not reading input after zero, so 0 1 2 is not suitable)\n"
             "Examples: 1 2 3, 3 1 2, 3 2 1, 3 0 0, 1 2 0, 1 0 0, 3 2 0\n";
     for (int i = 0; i < customers_number; ++i) {
@@ -112,7 +141,7 @@ int main() {
         int a[3];
         cin >> a[0] >> a[1] >> a[2];
         while (true) {
-            if (a[0] <= 0 || a[0] > 3 || a[1] <= 0 || a[1] > 3 || a[2] <= 0 || a[2] > 3) {
+            if (a[0] <= -1 || a[0] > 3 || a[1] < -1 || a[1] > 3 || a[2] < -1 || a[2] > 3) {
                 cout << "You entered incorrect line of aisles, please retry";
                 cin >> a[0] >> a[1] >> a[2];
                 continue;
@@ -121,20 +150,19 @@ int main() {
 
         }
         for (auto aisle: a) {
-            if (aisle == 0) {
-                break;
-            }
-            temp.deps_to_go.push_back(aisle - 1);
+            if (aisle != 0)
+                temp.deps_to_go.push_back(aisle - 1);
         }
         if (!temp.deps_to_go.empty())
             customers.push_back(temp);
     }
-    for (const auto &c: customers) {
+    for (auto c: customers) {
         cout << "ID " << c.ID << " ";
-        for (auto v: c.deps_to_go) {
-            cout << v << " ";
+        for (auto id: c.deps_to_go) {
+            cout << id << " ";
         }
-        cout << "\n";
+        cout << endl;
     }
+    //Запуск магазина в работу, ведь покупатели уже пришли
     StartDay();
 }
